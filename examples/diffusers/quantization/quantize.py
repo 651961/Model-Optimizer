@@ -557,6 +557,15 @@ def create_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Calibrate using prompts in the file instead of the default dataset.",
     )
+    calib_group.add_argument(
+        "--edit-metadata",
+        type=str,
+        default=None,
+        help=(
+            "JSON metadata for image-edit calibration. Each record needs a prompt and one of "
+            "edit_image, input_image(s), condition_images, or images."
+        ),
+    )
 
     export_group = parser.add_argument_group("Export Configuration")
     export_group.add_argument(
@@ -669,7 +678,14 @@ def main() -> None:
             block_size=args.block_size,
         )
 
-        if args.prompts_file is not None:
+        edit_metadata = Path(args.edit_metadata) if args.edit_metadata else None
+        if edit_metadata is not None:
+            if not edit_metadata.exists():
+                raise FileNotFoundError(
+                    f"User specified edit metadata {edit_metadata} does not exist."
+                )
+            prompts_dataset = None
+        elif args.prompts_file is not None:
             prompts_file = Path(args.prompts_file)
             assert prompts_file.exists(), (
                 f"User specified prompts file {prompts_file} does not exist."
@@ -679,6 +695,7 @@ def main() -> None:
             prompts_dataset = MODEL_DEFAULTS[model_type]["dataset"]
         calib_config = CalibrationConfig(
             prompts_dataset=prompts_dataset,
+            edit_metadata=edit_metadata,
             batch_size=args.batch_size,
             calib_size=args.calib_size,
             n_steps=args.n_steps,
@@ -715,7 +732,7 @@ def main() -> None:
         else:
             logger.info("Initializing calibration...")
             calibrator = Calibrator(pipeline_manager, calib_config, model_config.model_type, logger)
-            batched_prompts = calibrator.load_and_batch_prompts()
+            calibration_data = calibrator.load_calibration_data()
             quantizer = Quantizer(quant_config, model_config, logger)
 
             for backbone_name, backbone in pipeline_manager.iter_backbones():
@@ -725,7 +742,7 @@ def main() -> None:
                 # Calibration runs the full pipeline (not just `mod`), so the
                 # closure intentionally ignores the backbone argument.
                 def forward_loop(mod):
-                    calibrator.run_calibration(batched_prompts)
+                    calibrator.run_calibration(calibration_data)
 
                 quantizer.quantize_model(
                     backbone,

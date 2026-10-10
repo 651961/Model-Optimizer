@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import warnings
 from pathlib import Path
 from typing import Any
 
+from diffusers.utils import load_image
 from models_utils import MODEL_DEFAULTS, ModelType
 from pipeline_manager import PipelineManager
 from quantize_config import CalibrationConfig
@@ -72,18 +74,83 @@ class Calibrator:
             self.config.prompts_dataset["column"],
         )
 
-    def run_calibration(self, batched_prompts: list[list[str]]) -> None:
+    def load_edit_examples(self) -> list[dict[str, Any]]:
+        """Load image-edit calibration records from a JSON metadata file."""
+        if self.config.edit_metadata is None:
+            raise RuntimeError("edit_metadata is not configured")
+        metadata_path = self.config.edit_metadata
+        with metadata_path.open() as f:
+            records = json.load(f)
+        if isinstance(records, dict):
+            records = records.get("records", records.get("data"))
+        if not isinstance(records, list):
+            raise ValueError(f"Expected a JSON list in {metadata_path}")
+
+        examples = []
+        for index, record in enumerate(records[: self.config.calib_size]):
+            if not isinstance(record, dict) or not record.get("prompt"):
+                raise ValueError(f"Record {index} in {metadata_path} needs a non-empty 'prompt'")
+            image_value = next(
+                (
+                    record.get(key)
+                    for key in (
+                        "edit_image",
+                        "input_image",
+                        "input_images",
+                        "condition_images",
+                        "images",
+                    )
+                    if record.get(key) is not None
+                ),
+                None,
+            )
+            if image_value is None:
+                raise ValueError(
+                    f"Record {index} in {metadata_path} needs 'edit_image', 'input_images', or 'images'"
+                )
+            image_paths = [image_value] if isinstance(image_value, str) else image_value
+            if not isinstance(image_paths, list) or not image_paths:
+                raise ValueError(f"Record {index} in {metadata_path} has no input images")
+            images = []
+            for image_path in image_paths:
+                path = Path(image_path)
+                if not path.is_absolute():
+                    path = metadata_path.parent / path
+                if not path.exists():
+                    raise FileNotFoundError(f"Missing image for record {index}: {path}")
+                images.append(load_image(str(path)))
+            examples.append({"prompt": record["prompt"], "images": images})
+        if not examples:
+            raise ValueError(f"No calibration records found in {metadata_path}")
+        self.logger.info(
+            "Loaded %d image-edit records (%d condition images in the first record)",
+            len(examples),
+            len(examples[0]["images"]),
+        )
+        return examples
+
+    def load_calibration_data(self) -> list[Any]:
+        """Load either text prompts or image-edit records."""
+        if self.config.edit_metadata is not None:
+            return self.load_edit_examples()
+        return self.load_and_batch_prompts()
+
+    def run_calibration(self, calibration_data: list[Any]) -> None:
         """
         Run calibration steps on the pipeline.
 
         Args:
             batched_prompts: List of batched calibration prompts
         """
+        if self.config.edit_metadata is not None:
+            self._run_edit_calibration(calibration_data)
+            return
+
         self.logger.info(f"Starting calibration with {self.config.num_batches} batches")
         extra_args = MODEL_DEFAULTS.get(self.model_type, {}).get("inference_extra_args", {})
 
         with tqdm(total=self.config.num_batches, desc="Calibration", unit="batch") as pbar:
-            for i, prompt_batch in enumerate(batched_prompts):
+            for i, prompt_batch in enumerate(calibration_data):
                 if i >= self.config.num_batches:
                     break
 
@@ -104,6 +171,44 @@ class Calibrator:
                 pbar.update(1)
                 self.logger.debug(f"Completed calibration batch {i + 1}/{self.config.num_batches}")
         self.logger.info("Calibration completed successfully")
+
+    def _run_edit_calibration(self, examples: list[dict[str, Any]]) -> None:
+        """Calibrate Qwen-Image with one or more condition images per record."""
+        if self.model_type != ModelType.QWEN_IMAGE:
+            raise ValueError("Image-edit metadata calibration currently supports qwen-image only")
+        extra_args = dict(MODEL_DEFAULTS.get(self.model_type, {}).get("inference_extra_args", {}))
+        # Let Qwen-Image derive dimensions from each condition image's aspect ratio.
+        extra_args.pop("height", None)
+        extra_args.pop("width", None)
+        sample_sigmas = getattr(self.pipe.config, "sample_sigmas", None)
+        if sample_sigmas is not None:
+            sample_sigmas = list(sample_sigmas)
+            if len(sample_sigmas) != self.config.n_steps:
+                raise ValueError(
+                    "The pipeline sample_sigmas schedule has "
+                    f"{len(sample_sigmas)} steps, but --n-steps is {self.config.n_steps}. "
+                    "Set --n-steps to the checkpoint schedule length."
+                )
+            extra_args["sigmas"] = sample_sigmas
+            self.logger.info(
+                "Using checkpoint sample_sigmas for image-edit calibration: %s", sample_sigmas
+            )
+        self.logger.info(
+            "Starting image-edit calibration with %d records and %d denoising steps",
+            len(examples),
+            self.config.n_steps,
+        )
+        with tqdm(total=len(examples), desc="Image-edit calibration", unit="sample") as pbar:
+            for example in examples:
+                self.pipe(
+                    prompt=example["prompt"],
+                    image=example["images"],
+                    num_inference_steps=self.config.n_steps,
+                    output_type="latent",
+                    **extra_args,
+                )
+                pbar.update(1)
+        self.logger.info("Image-edit calibration completed successfully")
 
     def _run_wan_video_calibration(
         self, prompt_batch: list[str], extra_args: dict[str, Any]

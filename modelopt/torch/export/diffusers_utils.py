@@ -146,6 +146,14 @@ def generate_diffusion_dummy_inputs(
         "QwenImageTransformer2DModel",
         "qwen" in model_class_name.lower(),
     )
+    # Qwen-Image 2.1 uses a separate transformer class and a packed-latent
+    # forward signature.  Keep the same dummy-input path as Qwen-Image 1.x.
+    is_qwen21 = _is_model_type(
+        "diffusers.models.transformers",
+        "QwenImage21Transformer2DModel",
+        "QwenImage21" in model_class_name,
+    )
+    is_qwen = is_qwen or is_qwen21
 
     cfg = getattr(model, "config", None)
 
@@ -332,7 +340,11 @@ def generate_diffusion_dummy_inputs(
         # encoder_hidden_states_mask, img_shapes, and optional guidance.
         # Timesteps are continuous in [0, 1] (not the diffusers [0, 1000] scale).
         in_channels = getattr(cfg, "in_channels", 64)
-        joint_attention_dim = getattr(cfg, "joint_attention_dim", 3584)
+        # Qwen-Image 2.1 calls this field ``context_in_dim`` (4096); the
+        # older Qwen-Image config uses ``joint_attention_dim`` (3584).
+        joint_attention_dim = getattr(
+            cfg, "context_in_dim", getattr(cfg, "joint_attention_dim", 3584)
+        )
         guidance_embeds = getattr(cfg, "guidance_embeds", False)
 
         # Small packed spatial grid (already divided by the 2x2 patch size).
@@ -352,6 +364,15 @@ def generate_diffusion_dummy_inputs(
             ),
             "timestep": torch.tensor([0.5], device=device, dtype=dtype).expand(batch_size),
             "img_shapes": [[(1, packed_h, packed_w)]] * batch_size,
+            # Qwen-Image 2.1 marks the image slots in the joint text/image
+            # sequence.  The older Qwen-Image transformer ignores this key.
+            "img_mask": torch.cat(
+                [
+                    torch.zeros(batch_size, text_seq_len, device=device, dtype=torch.bool),
+                    torch.ones(batch_size, img_seq_len // 4, device=device, dtype=torch.bool),
+                ],
+                dim=1,
+            ),
             "return_dict": False,
         }
         if guidance_embeds:

@@ -95,7 +95,8 @@ class QuantizationConfig:
 class CalibrationConfig:
     """Configuration for calibration process."""
 
-    prompts_dataset: dict | Path
+    prompts_dataset: dict | Path | None = None
+    edit_metadata: Path | None = None
     batch_size: int = 2
     calib_size: int = 128
     n_steps: int = 30
@@ -108,6 +109,10 @@ class CalibrationConfig:
             raise ValueError("Calibration size must be positive.")
         if self.n_steps <= 0:
             raise ValueError("Number of steps must be positive.")
+        if self.prompts_dataset is None and self.edit_metadata is None:
+            raise ValueError("One of prompts_dataset or edit_metadata is required.")
+        if self.prompts_dataset is not None and self.edit_metadata is not None:
+            raise ValueError("prompts_dataset and edit_metadata are mutually exclusive.")
 
     @property
     def num_batches(self) -> int:
